@@ -36,7 +36,7 @@ class ImageMetadata:
 
 
 class GlobalOptimizationStitcher:
-    """전역 최적화 파노라마 스티칭: 센서 배치 → 인접 이미지 피처 정합"""
+    """전역 최적화 파노라마 스티칭: 센서 배치 > 인접 이미지 피처 정합"""
     
     def __init__(self, 
                  folder_path: str, 
@@ -98,9 +98,10 @@ class GlobalOptimizationStitcher:
         self.PIXEL_PER_CM_X = None
         self.PIXEL_PER_CM_Y = None
         
-        # 이미지 위치 저장 (전역 최적화용)
+        # 이미지 위치 및 회전 저장 (전역 최적화용)
         self.positions: List[Tuple[int, int]] = []
-        
+        self.rotations: List[float] = []  # 각 이미지의 회전 각도 (도)
+
         # 피처 디텍터
         self.feature_detector = None
         self.feature_matcher = None
@@ -134,10 +135,10 @@ class GlobalOptimizationStitcher:
                 self.feature_detector = cv2.ORB_create(nfeatures=2000)
                 self.feature_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
             
-            print(f"  ✓ {self.feature_method} feature detector initialized")
+            print(f"  OK {self.feature_method} feature detector initialized")
                 
         except Exception as e:
-            print(f"  ⚠ Feature detector initialization failed: {e}")
+            print(f"  WARNING Feature detector initialization failed: {e}")
             print(f"  Falling back to sensor-only mode")
             self.use_global_optimization = False
     
@@ -184,7 +185,7 @@ class GlobalOptimizationStitcher:
                 meta = ImageMetadata.parse_filename(img_path.name)
                 temp_data.append((meta, img_path))
             except ValueError as e:
-                print(f"  ⚠ Skipping {img_path.name}: {e}")
+                print(f"  WARNING Skipping {img_path.name}: {e}")
         
         if len(temp_data) == 0:
             raise ValueError("No valid images found")
@@ -213,7 +214,7 @@ class GlobalOptimizationStitcher:
             if idx < 5:
                 print(f"  [{idx:03d}] F:{meta.front:05d} B:{meta.back:05d} R:{meta.right:05d} L:{meta.left:05d}")
         
-        print(f"\n✓ Successfully loaded {len(self.images)} images")
+        print(f"\nOK Successfully loaded {len(self.images)} images")
     
     def calculate_sensor_offset(self, idx: int) -> Tuple[int, int]:
         """센서 기반 오프셋 계산"""
@@ -257,22 +258,24 @@ class GlobalOptimizationStitcher:
         
         h = self.IMAGE_PIXEL_HEIGHT
         w = self.IMAGE_PIXEL_WIDTH
-        
+
         self.positions = [(0, 0)]
-        
+        self.rotations = [0.0]  # 첫 이미지는 회전 없음
+
         for i in range(1, len(self.images)):
             dx, dy = self.calculate_sensor_offset(i)
             prev_x, prev_y = self.positions[-1]
             new_x = prev_x + dx
             new_y = prev_y + dy
             self.positions.append((new_x, new_y))
-            
+            self.rotations.append(0.0)  # 초기값은 회전 없음
+
             if i < 5 or i % 10 == 0:
-                direction_v = "↑" if dy < 0 else "↓" if dy > 0 else "—"
-                direction_h = "←" if dx < 0 else "→" if dx > 0 else ""
-                print(f"Image {i:3d}: offset=({dx:+5d}, {dy:+5d}) {direction_h}{direction_v} → pos=({new_x:6d}, {new_y:6d}) [sensor]")
-        
-        print(f"\n✓ Initial layout completed with {len(self.positions)} images")
+                direction_v = "^" if dy < 0 else "v" if dy > 0 else "-"
+                direction_h = "<" if dx < 0 else ">" if dx > 0 else ""
+                print(f"Image {i:3d}: offset=({dx:+5d}, {dy:+5d}) {direction_h}{direction_v} > pos=({new_x:6d}, {new_y:6d}) [sensor]")
+
+        print(f"\nOK Initial layout completed with {len(self.positions)} images")
     
     def _create_overlap_masks(self, shape1: Tuple[int, int], shape2: Tuple[int, int],
                               idx1: int, idx2: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -385,15 +388,15 @@ class GlobalOptimizationStitcher:
         
         return neighbors
     
-    def match_features_between_images(self, idx1: int, idx2: int) -> Optional[Tuple[int, int]]:
-        """두 이미지 간 피처 매칭으로 상대 오프셋 계산
+    def match_features_between_images(self, idx1: int, idx2: int) -> Optional[Tuple[int, int, float]]:
+        """두 이미지 간 피처 매칭으로 상대 오프셋 및 회전 계산
 
         Args:
             idx1: 기준 이미지 인덱스
             idx2: 비교 이미지 인덱스
 
         Returns:
-            (dx, dy): idx2가 idx1 대비 이동해야 할 오프셋, 실패시 None
+            (dx, dy, rotation): idx2가 idx1 대비 이동해야 할 오프셋과 회전 각도(도), 실패시 None
         """
         if not self.use_global_optimization:
             return None
@@ -465,17 +468,39 @@ class GlobalOptimizationStitcher:
             
             if np.sum(valid_mask) < 5:
                 return None
-            
+
             # 중앙값으로 로버스트 추정
             dx_feature = int(np.median(displacements[valid_mask, 0]))
             dy_feature = int(np.median(displacements[valid_mask, 1]))
-            
+
+            # 회전 각도 추정 (유효한 매칭점들만 사용)
+            valid_src_pts = src_pts[valid_mask]
+            valid_dst_pts = dst_pts[valid_mask]
+
+            rotation_angle = 0.0
+            if len(valid_src_pts) >= 3:
+                # 아핀 변환 행렬 추정 (회전 + 이동)
+                affine_matrix, inliers = cv2.estimateAffinePartial2D(
+                    valid_src_pts,
+                    valid_dst_pts,
+                    method=cv2.RANSAC,
+                    ransacReprojThreshold=5.0
+                )
+
+                if affine_matrix is not None and inliers is not None and np.sum(inliers) >= 3:
+                    # 회전 각도 추출 (라디안 -> 도)
+                    rotation_angle = np.arctan2(affine_matrix[1, 0], affine_matrix[0, 0]) * 180.0 / np.pi
+
+                    # 너무 큰 회전은 무시 (5도 이상)
+                    if abs(rotation_angle) > 5.0:
+                        rotation_angle = 0.0
+
             # 피처 매칭 결과: img1의 점이 img2에서 (dx_feature, dy_feature) 이동
             # 이는 img2가 img1 대비 (-dx_feature, -dy_feature) 위치에 있다는 의미
             correction_dx = -dx_feature - sensor_dx
             correction_dy = -dy_feature - sensor_dy
-            
-            return (correction_dx, correction_dy)
+
+            return (correction_dx, correction_dy, rotation_angle)
             
         except Exception as e:
             return None
@@ -498,10 +523,10 @@ class GlobalOptimizationStitcher:
             if i < 5 or len(neighbors) > 0 and i % 10 == 0:
                 print(f"Image {i:3d}: {len(neighbors)} neighbors {neighbors[:5]}{'...' if len(neighbors) > 5 else ''}")
         
-        print(f"\n✓ Found {total_pairs} overlapping pairs")
+        print(f"\nOK Found {total_pairs} overlapping pairs")
         
         if total_pairs == 0:
-            print("⚠ No overlapping images found, skipping refinement")
+            print("WARNING No overlapping images found, skipping refinement")
             return
         
         print(f"\n{'='*60}")
@@ -512,32 +537,35 @@ class GlobalOptimizationStitcher:
         for iteration in range(self.refinement_iterations):
             print(f"\nIteration {iteration + 1}/{self.refinement_iterations}")
             
-            # 각 이미지에 대한 보정값 수집
+            # 각 이미지에 대한 보정값 및 회전 수집
             corrections: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+            rotation_corrections: Dict[int, List[float]] = defaultdict(list)
             successful_matches = 0
             failed_matches = 0
-            
+
             # 모든 인접 쌍에 대해 피처 매칭
             processed_pairs = set()
-            
+
             for i in range(len(self.images)):
                 if i % 10 == 0 or i < 5:
                     print(f"  Processing image {i}/{len(self.images)}...", end='\r')
-                
+
                 for j in neighbor_map[i]:
                     # 중복 처리 방지
                     pair = tuple(sorted([i, j]))
                     if pair in processed_pairs:
                         continue
                     processed_pairs.add(pair)
-                    
+
                     # 피처 매칭
                     correction = self.match_features_between_images(i, j)
-                    
+
                     if correction is not None:
-                        dx, dy = correction
+                        dx, dy, rotation = correction
                         # j를 보정
                         corrections[j].append((dx, dy))
+                        if abs(rotation) > 0.1:  # 0.1도 이상의 회전만 기록
+                            rotation_corrections[j].append(rotation)
                         successful_matches += 1
                     else:
                         failed_matches += 1
@@ -549,28 +577,37 @@ class GlobalOptimizationStitcher:
                 print("  No successful matches, stopping refinement")
                 break
             
-            # 보정 적용 (평균값 사용)
+            # 보정 적용 (중앙값 사용)
             max_correction = 0
             corrected_count = 0
-            
+            rotation_count = 0
+
             for i, correction_list in corrections.items():
                 if len(correction_list) > 0:
                     # 중앙값으로 로버스트하게
                     dx_corrections = [c[0] for c in correction_list]
                     dy_corrections = [c[1] for c in correction_list]
-                    
+
                     dx_median = int(np.median(dx_corrections))
                     dy_median = int(np.median(dy_corrections))
-                    
-                    # 보정 적용
+
+                    # 위치 보정 적용
                     x, y = self.positions[i]
                     self.positions[i] = (x + dx_median, y + dy_median)
-                    
+
                     correction_magnitude = np.sqrt(dx_median**2 + dy_median**2)
                     max_correction = max(max_correction, correction_magnitude)
                     corrected_count += 1
-            
+
+                    # 회전 보정 적용
+                    if i in rotation_corrections and len(rotation_corrections[i]) > 0:
+                        rotation_median = float(np.median(rotation_corrections[i]))
+                        self.rotations[i] += rotation_median
+                        rotation_count += 1
+
             print(f"  Applied corrections to {corrected_count} images")
+            if rotation_count > 0:
+                print(f"  Applied rotation corrections to {rotation_count} images")
             print(f"  Max correction: {max_correction:.1f} pixels")
             
             # 수렴 판단
@@ -578,7 +615,7 @@ class GlobalOptimizationStitcher:
                 print(f"  Converged (max correction < 2 pixels)")
                 break
         
-        print(f"\n✓ Position refinement completed")
+        print(f"\nOK Position refinement completed")
     
     def create_panorama(self) -> np.ndarray:
         """파노라마 생성"""
@@ -617,14 +654,36 @@ class GlobalOptimizationStitcher:
         
         # 이미지 배치
         for i, (x, y) in enumerate(self.positions):
+            # 회전 적용
+            img = self.images[i].copy()
+            rotation_angle = self.rotations[i]
+            mask = None
+
+            if abs(rotation_angle) > 0.1:  # 0.1도 이상의 회전만 적용
+                # 이미지 중심을 기준으로 회전
+                center = (w // 2, h // 2)
+                rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+                img = cv2.warpAffine(img, rotation_matrix, (w, h),
+                                     borderMode=cv2.BORDER_CONSTANT,
+                                     borderValue=(0, 0, 0))
+
+                # 회전으로 생긴 검은색 영역을 마스크로 생성
+                mask = cv2.warpAffine(
+                    np.ones((h, w), dtype=np.uint8) * 255,
+                    rotation_matrix,
+                    (w, h),
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0
+                )
+
             abs_x = x + offset_x
             abs_y = y + offset_y
-            
+
             y1 = max(0, min(abs_y, canvas_h - h))
             x1 = max(0, min(abs_x, canvas_w - w))
             y2 = y1 + h
             x2 = x1 + w
-            
+
             img_y1, img_y2 = 0, h
             img_x1, img_x2 = 0, w
 
@@ -642,7 +701,21 @@ class GlobalOptimizationStitcher:
                 x2 = canvas_w
 
             if y2 > y1 and x2 > x1:
-                canvas[y1:y2, x1:x2] = self.images[i][img_y1:img_y2, img_x1:img_x2]
+                img_crop = img[img_y1:img_y2, img_x1:img_x2]
+
+                if mask is not None:
+                    # 마스크 적용: 검은색 영역은 기존 캔버스 유지
+                    mask_crop = mask[img_y1:img_y2, img_x1:img_x2]
+                    # 마스크가 있는 부분만 새 이미지로 덮어쓰기
+                    canvas_region = canvas[y1:y2, x1:x2]
+                    canvas[y1:y2, x1:x2] = np.where(
+                        mask_crop[:, :, np.newaxis] > 0,
+                        img_crop,
+                        canvas_region
+                    )
+                else:
+                    # 회전 없는 경우 그냥 덮어쓰기
+                    canvas[y1:y2, x1:x2] = img_crop
         
         canvas = self._crop_canvas(canvas)
         
@@ -722,7 +795,7 @@ class GlobalOptimizationStitcher:
             output_path = str(base_path.parent / new_filename)
         
         if w > max_dimension or h > max_dimension:
-            print(f"\n⚠ Image too large ({w}x{h}), resizing for JPG...")
+            print(f"\nWARNING Image too large ({w}x{h}), resizing for JPG...")
             
             if w > h:
                 new_w = max_dimension
@@ -737,7 +810,7 @@ class GlobalOptimizationStitcher:
             png_path = output_path.replace('.jpg', '_full.png')
             try:
                 img_pil.save(png_path, compress_level=3)
-                print(f"✓ Full size (PNG): {png_path}")
+                print(f"OK Full size (PNG): {png_path}")
             except Exception as e:
                 print(f"  Failed to save full size PNG: {e}")
             
@@ -747,14 +820,14 @@ class GlobalOptimizationStitcher:
         
         try:
             img_to_save.save(output_path, quality=95)
-            print(f"✓ Saved: {output_path}")
+            print(f"OK Saved: {output_path}")
         except Exception as e:
             try:
                 png_path = output_path.replace('.jpg', '.png')
                 img_to_save.save(png_path, compress_level=6)
-                print(f"✓ Saved (PNG): {png_path}")
+                print(f"OK Saved (PNG): {png_path}")
             except Exception as e2:
-                print(f"❌ Failed to save image: {e2}")
+                print(f"ERROR Failed to save image: {e2}")
     
     def process(self, output_dir: str = "./output"):
         """전체 프로세스 실행"""
@@ -773,7 +846,7 @@ class GlobalOptimizationStitcher:
         self.save_panorama(panorama, str(output_path / output_filename))
         
         print(f"\n{'='*60}")
-        print("✓ Panorama generation completed!")
+        print("OK Panorama generation completed!")
         print(f"{'='*60}")
 
 
@@ -836,6 +909,6 @@ if __name__ == "__main__":
         stitcher.process(output_dir=output_folder)
         
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\nERROR Error: {e}")
         import traceback
         traceback.print_exc()
