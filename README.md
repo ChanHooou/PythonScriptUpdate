@@ -158,7 +158,138 @@ p002 f00089 b00497 r00823 l00267.jpg
 
 MIT License
 
+## 버전 가이드
+
+### 어떤 버전을 사용해야 할까요?
+
+#### v2.1 (최신) - 표준 좌표계 사용 시 ✨ **추천**
+- **우측 하단 (0,0) 기준 좌표계**
+- 건물 도면의 표준 좌표계와 일치
+- `rotate_output=True` 사용 권장
+- 출력 파일명: `result_Xmin,Ymin-Xmax,Ymax.jpg`
+- **사용 케이스**: 건물 도면과 정확한 좌표 매칭이 필요한 경우
+
+#### v2.0 - 간소화된 출력
+- Median 기반 robust 트렌드 추정
+- JPG 출력만 지원 (PNG 제거)
+- 간소화된 파일명
+- **사용 케이스**: 빠른 처리와 간단한 출력이 필요한 경우
+
+#### v1.x - 레거시
+- 상세한 파일명 (폴더명, 센서 모드 등 포함)
+- PNG/JPG 출력 지원
+- **사용 케이스**: 기존 워크플로우 호환성이 필요한 경우
+
+---
+
+## v2.1 상세 설명 (최신)
+
+### 좌표계
+
+v2.1은 건물 도면의 표준 좌표계를 사용합니다 (`rotate_output=True` 시):
+
+```
+좌측 상단          우측 상단
+(1620, 810)        (1620, 0)
+    ┌─────────────────┐
+    │                 │
+    │                 │  X축 ↑ (B센서)
+    │                 │
+    │                 │
+    └─────────────────┘
+(0, 810)           (0, 0) ← 원점
+좌측 하단          우측 하단
+        ← Y축 (BUILDING_WIDTH - L센서)
+```
+
+- **원점**: 우측 하단 (0, 0)
+- **X축**: B센서 값 그대로 사용 (하단 0 → 상단 BUILDING_HEIGHT)
+- **Y축**: BUILDING_WIDTH - L센서 값 (우측 0 → 좌측 BUILDING_WIDTH)
+
+### 사용법
+
+```bash
+python panorama_hybrid_v2.1.py <image_folder> [output_folder] [sensor_mode] [movement_direction] [use_global] [overlap_threshold] [iterations] [building_height] [building_width] [image_real_width] [image_real_height] [min_bf_sensor_diff] [rotate_output]
+```
+
+### 예제
+
+```bash
+# 기본 사용 (우측 하단 0,0 기준)
+python panorama_hybrid_v2.1.py ./images ./output BL backward 0 0.3 3 1620 810 125 87 20 True
+
+# building_width 자동 계산 필요 시
+python panorama_hybrid_v2.1.py ./images ./output BL backward 0 0.3 3 1620 820 125 87 20 True
+```
+
+### 주의사항
+
+**음수 좌표 발생 방지**: `building_width`는 다음 조건을 만족해야 합니다:
+```
+building_width >= L_sensor_max + image_real_width
+```
+
+예: L센서 최대값이 669cm이고 이미지 가로가 150cm인 경우:
+```bash
+# building_width는 최소 820cm 이상 필요
+python panorama_hybrid_v2.1.py ./images ./output BL backward 0 0.3 3 1620 820
+```
+
+---
+
+## v2.0 상세 설명
+
+### 주요 기능
+
+1. **Median 기반 Robust 트렌드 추정**
+   - 이상치에 강한 센서 값 보정
+   - Diff 기반 이상치 감지
+   - MAD (Median Absolute Deviation) 자동 threshold
+
+2. **간소화된 출력**
+   - 파일명: `result_Xmin,Ymin-Xmax,Ymax.jpg`
+   - JPG 출력만 지원 (PNG 제거)
+   - 처리 속도 향상
+
+### 사용법
+
+```bash
+python panorama_hybrid_v2.0.py <image_folder> [output_folder] [sensor_mode] [movement_direction] [use_global] [overlap_threshold] [iterations] [building_height] [building_width] [image_real_width] [image_real_height] [min_bf_sensor_diff] [rotate_output]
+```
+
+### 예제
+
+```bash
+# 기본 사용
+python panorama_hybrid_v2.0.py ./images ./output BL forward 0 0.3 3 1620 810 125 87 20 True
+
+# 간단한 실행
+python panorama_hybrid_v2.0.py ./images
+```
+
+---
+
 ## 변경 이력
+
+### v2.1 (2025-12-08) ✨ **최신**
+- **우측 하단 (0,0) 기준 좌표계 도입**
+- 건물 도면의 표준 좌표계와 일치
+- X축: B센서 값 직접 사용
+- Y축: BUILDING_WIDTH - L센서 값
+- rotate_output=True 권장
+- 파일명 간소화: `result_Xmin,Ymin-Xmax,Ymax.jpg`
+
+### v2.0 (2025-12-08)
+- **Median 기반 robust 트렌드 추정**
+- Diff 기반 이상치 감지 및 보정
+- MAD (Median Absolute Deviation) 자동 threshold
+- JPG 출력만 지원 (PNG 제거)
+- 파일명 간소화: `result_Xmin,Ymin-Xmax,Ymax.jpg`
+- 전체 offset과 부분 점프 모두 처리 가능
+
+### v1.6 (2025-12-08)
+- Median 기반 robust 트렌드 추정
+- 이상치에 강한 센서 보정
 
 ### v1.1 (2025-11-24)
 - **회전/기울기 자동 보정 기능 추가**
